@@ -14,6 +14,7 @@ import os
 import re
 import sys
 import time
+import datetime
 
 import requests
 
@@ -29,50 +30,91 @@ def _get(url: str) -> str:
     return r.text
 
 
-# ── Upcoming events page parser ───────────────────────────────────────────────
+# ── Event list parser (shared by upcoming + completed pages) ──────────────────
 
-def parse_upcoming_event(html: str, debug: bool = False) -> tuple[str, str, str, str]:
-    """
-    Parse the first upcoming event from the events list page.
-    Returns (event_name, date, location, event_url).
-    """
-    if debug:
-        print("\n--- RAW HTML (first 3000 chars) ---")
-        print(html[:3000])
-        print("--- END ---\n")
+def _parse_date(date_str: str) -> datetime.date | None:
+    """Parse 'Month DD, YYYY' into a date object."""
+    try:
+        return datetime.datetime.strptime(date_str.strip(), "%B %d, %Y").date()
+    except ValueError:
+        return None
 
-    # Each event is in a <td> cell containing an <a> link and a <span> with the date
-    cell_pattern = re.compile(
+
+def _parse_event_list(html: str) -> list[dict]:
+    """
+    Parse all events from an ufcstats event list page.
+    Returns list of {name, url, date_str, date, location}.
+    """
+    event_pattern = re.compile(
         r'<a[^>]+href="(http://www\.ufcstats\.com/event-details/[a-f0-9]+)"[^>]*>\s*([^<\n]+?)\s*</a>'
         r'.*?<span[^>]*class="b-statistics__date"[^>]*>\s*([^<\n]+?)\s*</span>',
         re.DOTALL,
     )
 
-    location_pattern = re.compile(
-        r'<td[^>]*class="b-statistics__table-col"[^>]*>\s*([A-Za-z][^<\n]{3,80}?)\s*</td>'
-    )
+    events = []
+    for m in event_pattern.finditer(html):
+        url       = m.group(1).strip()
+        name      = re.sub(r'\s+', ' ', m.group(2)).strip()
+        date_str  = re.sub(r'\s+', ' ', m.group(3)).strip()
+        date      = _parse_date(date_str)
 
-    event_match = cell_pattern.search(html)
-    if not event_match:
-        raise ValueError(
-            "No upcoming event found on ufcstats.com/statistics/events/upcoming. "
-            "Run with --debug to inspect the raw HTML."
-        )
+        # Location: next <td> after this match
+        next_td = re.search(r'<td[^>]*>(.*?)</td>', html[m.end():], re.DOTALL)
+        if next_td:
+            loc_text = re.sub(r'<[^>]+>', '', next_td.group(1)).strip()
+            location = re.sub(r'\s+', ' ', loc_text).strip() or "N/A"
+        else:
+            location = "N/A"
 
-    event_url  = event_match.group(1).strip()
-    event_name = re.sub(r'\s+', ' ', event_match.group(2)).strip()
-    date       = re.sub(r'\s+', ' ', event_match.group(3)).strip()
+        events.append({
+            "name": name,
+            "url": url,
+            "date_str": date_str,
+            "date": date,
+            "location": location,
+        })
 
-    # Location is the next <td> after the event cell (plain text, no child tags)
-    search_start = event_match.end()
-    next_td = re.search(r'<td[^>]*>(.*?)</td>', html[search_start:], re.DOTALL)
-    if next_td:
-        loc_text = re.sub(r'<[^>]+>', '', next_td.group(1)).strip()
-        location = re.sub(r'\s+', ' ', loc_text).strip() or "N/A"
-    else:
-        location = "N/A"
+    return events
 
-    return event_name, date, location, event_url
+
+def find_current_event(debug: bool = False) -> tuple[str, str, str, str]:
+    """
+    Find the most relevant event: today's event if one exists, otherwise
+    the next upcoming event. Checks both completed and upcoming pages.
+    Returns (event_name, date, location, event_url).
+    """
+    today = datetime.date.today()
+
+    # Pull both pages
+    upcoming_html   = _get("http://www.ufcstats.com/statistics/events/upcoming")
+    completed_html  = _get("http://www.ufcstats.com/statistics/events/completed")
+
+    upcoming_events  = _parse_event_list(upcoming_html)
+    completed_events = _parse_event_list(completed_html)
+
+    all_events = upcoming_events + completed_events
+
+    if not all_events:
+        raise ValueError("No events found on ufcstats.com.")
+
+    # Priority 1: event happening today
+    for ev in all_events:
+        if ev["date"] == today:
+            return ev["name"], ev["date_str"], ev["location"], ev["url"]
+
+    # Priority 2: most recent past event (closest to today going backward)
+    past = [ev for ev in all_events if ev["date"] and ev["date"] < today]
+    if past:
+        closest = max(past, key=lambda e: e["date"])
+        return closest["name"], closest["date_str"], closest["location"], closest["url"]
+
+    # Priority 3: next future event (closest upcoming)
+    future = [ev for ev in all_events if ev["date"] and ev["date"] > today]
+    if future:
+        closest = min(future, key=lambda e: e["date"])
+        return closest["name"], closest["date_str"], closest["location"], closest["url"]
+
+    raise ValueError("Could not determine a current or upcoming UFC event.")
 
 
 # ── Event details page parser ─────────────────────────────────────────────────
@@ -173,17 +215,14 @@ def parse_fight_card(html: str, debug: bool = False) -> list[dict]:
 
 def scrape_upcoming_card(debug: bool = False) -> dict:
     """
-    Scrape the next upcoming UFC event from ufcstats.com.
+    Scrape the most current UFC event (today if one exists, otherwise next upcoming).
     Returns a dict with event info and the full fight card.
     """
-    print("Fetching upcoming UFC event list...")
-    events_url = "http://www.ufcstats.com/statistics/events/upcoming"
-    events_html = _get(events_url)
-    time.sleep(DELAY)
-
-    event_name, date, location, event_url = parse_upcoming_event(events_html, debug=debug)
+    print("Finding current UFC event...")
+    event_name, date, location, event_url = find_current_event(debug=debug)
     print(f"  Found: {event_name} — {date}")
     print(f"  URL: {event_url}")
+    time.sleep(DELAY)
 
     print("Fetching fight card...")
     card_html = _get(event_url)

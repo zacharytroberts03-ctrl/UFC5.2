@@ -80,16 +80,15 @@ for key in ["do_analysis", "f1", "f2", "total_stake"]:
 
 # -- Helpers -------------------------------------------------------------------
 
-def get_week_key() -> tuple:
-    """Returns (year, week_number) -- cache key so card refreshes each Monday."""
+def get_day_key() -> tuple:
+    """Returns (year, month, day) -- cache key so card refreshes each day."""
     today = datetime.date.today()
-    iso = today.isocalendar()
-    return (iso[0], iso[1])
+    return (today.year, today.month, today.day)
 
 
 @st.cache_data
-def load_card_for_week(week_key: tuple) -> dict:
-    """Fetch next UFC event, cached per week."""
+def load_card_for_day(day_key: tuple) -> dict:
+    """Fetch current UFC event, cached per day."""
     return scrape_upcoming_card()
 
 
@@ -664,7 +663,7 @@ with tab1:
     else:
         with st.spinner("Loading upcoming fight card..."):
             try:
-                card = load_card_for_week(get_week_key())
+                card = load_card_for_day(get_day_key())
             except Exception as e:
                 st.error(f"Could not load upcoming card: {e}")
                 card = None
