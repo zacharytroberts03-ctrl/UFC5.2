@@ -3,9 +3,11 @@ Tool: scrape_ufc_fighter.py
 Purpose: Given a UFC fighter's name, search ufcstats.com, find their profile,
          and return structured stats data as a dict (or JSON if run directly).
 
+Uses direct HTTP requests — no Firecrawl required.
+
 Usage:
   python tools/scrape_ufc_fighter.py "Jon Jones"
-  python tools/scrape_ufc_fighter.py "Jon Jones" --debug   # prints raw FireCrawl markdown
+  python tools/scrape_ufc_fighter.py "Jon Jones" --debug
 """
 
 import os
@@ -13,43 +15,22 @@ import re
 import sys
 import time
 import json
-from firecrawl import Firecrawl
-from dotenv import load_dotenv
 
-# Force UTF-8 output on Windows to avoid charmap encoding errors with fighter names
+import requests
+
+# Force UTF-8 output on Windows
 if sys.stdout.encoding != "utf-8":
     sys.stdout = open(sys.stdout.fileno(), mode="w", encoding="utf-8", buffering=1)
 
-# ── Config ──────────────────────────────────────────────────────────────────
-load_dotenv()
-
-DELAY = 2  # seconds between FireCrawl requests
-
-
-def _get_firecrawl():
-    """Create a Firecrawl client using the current environment key."""
-    key = os.getenv("FIRECRAWL_API_KEY")
-    if not key:
-        raise EnvironmentError("FIRECRAWL_API_KEY not set. Add it to your Streamlit secrets.")
-    return Firecrawl(api_key=key)
+HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+TIMEOUT = 15
+DELAY = 1
 
 
-# ── FireCrawl helper ─────────────────────────────────────────────────────────
-
-def firecrawl_get(url: str) -> str:
-    """Scrape a URL with FireCrawl and return markdown. Retries once on 429."""
-    client = _get_firecrawl()
-    try:
-        result = client.scrape(url, formats=["markdown"])
-        return result.markdown or ""
-    except Exception as e:
-        err = str(e)
-        if "429" in err or "rate" in err.lower():
-            print("  Rate limited. Waiting 10s then retrying...")
-            time.sleep(10)
-            result = client.scrape(url, formats=["markdown"])
-            return result.markdown or ""
-        raise
+def _get(url: str) -> str:
+    r = requests.get(url, headers=HEADERS, timeout=TIMEOUT)
+    r.raise_for_status()
+    return r.text
 
 
 # ── Fighter search ───────────────────────────────────────────────────────────
@@ -66,49 +47,60 @@ def find_fighter_url(name: str, debug: bool = False) -> tuple[str, str]:
     search_url = f"http://www.ufcstats.com/statistics/fighters?char={last_initial}&page=all"
     print(f"  Searching: {search_url}")
 
-    markdown = firecrawl_get(search_url)
+    html = _get(search_url)
     time.sleep(DELAY)
 
     if debug:
-        print("\n--- RAW SEARCH MARKDOWN (first 3000 chars) ---")
-        print(markdown[:3000])
+        print("\n--- RAW SEARCH HTML (first 3000 chars) ---")
+        print(html[:3000])
         print("--- END ---\n")
 
-    if not markdown:
-        raise ValueError(f'Fighter "{name}": empty response from ufcstats.com search page.')
-
+    # Each fighter row has: first name cell, last name cell, nickname cell — all same URL
+    row_pattern = re.compile(
+        r'<tr[^>]*class="b-statistics__table-row"[^>]*>(.*?)</tr>',
+        re.DOTALL,
+    )
     link_pattern = re.compile(
-        r'\[([^\]]+)\]\((http://www\.ufcstats\.com/fighter-details/[a-f0-9]+)\)',
-        re.IGNORECASE
+        r'<a[^>]+href="(http://www\.ufcstats\.com/fighter-details/[a-f0-9]+)"[^>]*>\s*([^<\n]+?)\s*</a>'
     )
 
-    url_to_parts: dict[str, list[str]] = {}
-    for m in link_pattern.finditer(markdown):
-        part = m.group(1).strip()
-        url = m.group(2).strip()
-        if url not in url_to_parts:
-            url_to_parts[url] = []
-        if part not in url_to_parts[url]:
-            url_to_parts[url].append(part)
+    candidates: list[tuple[str, str]] = []  # (url, full_name)
+    seen_urls: set[str] = set()
 
-    if not url_to_parts:
+    for row_match in row_pattern.finditer(html):
+        row_html = row_match.group(1)
+        links = link_pattern.findall(row_html)
+        if not links:
+            continue
+
+        # All links in the row share the same URL; first = first name, second = last name
+        url = links[0][0]
+        if url in seen_urls:
+            continue
+        seen_urls.add(url)
+
+        first = links[0][1].strip() if len(links) > 0 else ""
+        last  = links[1][1].strip() if len(links) > 1 else ""
+        full  = f"{first} {last}".strip()
+
+        if full:
+            candidates.append((url, full))
+
+    if not candidates:
         raise ValueError(
-            f'Fighter "{name}" not found — no fighter links parsed from search page.\n'
-            f'Run with --debug to inspect raw markdown.'
+            f'Fighter "{name}" not found — no fighters parsed from search page.\n'
+            f'Run with --debug to inspect raw HTML.'
         )
-
-    # Take only first 2 parts (first + last name), ignoring any nickname links
-    candidates = [(url, " ".join(parts_list[:2])) for url, parts_list in url_to_parts.items()]
 
     name_lower = name.strip().lower()
     input_words = set(name_lower.split())
 
-    # 1. Exact match
+    # 1. Exact full-name match
     for url, full in candidates:
         if full.lower() == name_lower:
             return url, full
 
-    # 2. All input words present in candidate name
+    # 2. All input words present
     partial = [(url, full) for url, full in candidates
                if input_words.issubset(set(full.lower().split()))]
     if len(partial) == 1:
@@ -116,29 +108,28 @@ def find_fighter_url(name: str, debug: bool = False) -> tuple[str, str]:
     if len(partial) > 1:
         return min(partial, key=lambda x: len(x[1]))
 
-    # 3. Last name fuzzy match
-    last = parts[-1].lower()
-    fuzzy = [(url, full) for url, full in candidates if last in full.lower()]
+    # 3. Last name contains match
+    last_word = parts[-1].lower()
+    fuzzy = [(url, full) for url, full in candidates if last_word in full.lower()]
     if fuzzy:
         return fuzzy[0]
 
     raise ValueError(
         f'Fighter "{name}" not found on ufcstats.com.\n'
-        f'Tip: check spelling, try full name (e.g., "Jon Jones"), or use --debug to inspect markdown.'
+        f'Tip: check spelling, try full name (e.g., "Jon Jones").'
     )
 
 
-# ── Stat parsing helpers ──────────────────────────────────────────────────────
+# ── Stat parsing ─────────────────────────────────────────────────────────────
 
-def parse_stat(markdown: str, *labels) -> str:
-    """Extract a labeled stat from ufcstats.com profile markdown."""
+def parse_stat_html(html: str, *labels) -> str:
+    """Extract a labeled stat value from the fighter profile HTML."""
     for label in labels:
-        escaped = re.escape(label)
         pattern = re.compile(
-            rf'_{escaped}_\s*[\r\n]+\s*([\S][^\r\n]*)',
-            re.IGNORECASE
+            r'<i[^>]*>\s*' + re.escape(label) + r'\s*</i>\s*([^<\n]+?)\s*</li>',
+            re.IGNORECASE | re.DOTALL,
         )
-        m = pattern.search(markdown)
+        m = pattern.search(html)
         if m:
             val = m.group(1).strip()
             if val and val not in ('--', '-', ''):
@@ -146,19 +137,20 @@ def parse_stat(markdown: str, *labels) -> str:
     return "N/A"
 
 
-def parse_record(markdown: str) -> dict:
-    """Parse W-L-D record from the profile heading."""
-    m = re.search(r'Record:\s*(\d+)-(\d+)-(\d+)', markdown, re.IGNORECASE)
+def parse_record(html: str) -> dict:
+    """Parse W-L-D record from fighter profile HTML."""
+    # ufcstats shows record like: <span class="b-content__title-record">Record: 20-7-1</span>
+    m = re.search(r'Record:\s*(\d+)-(\d+)-(\d+)', html, re.IGNORECASE)
     if m:
         return {"wins": m.group(1), "losses": m.group(2), "draws": m.group(3)}
-    m = re.search(r'\b(\d+)-(\d+)-(\d+)\b', markdown)
+    # Fallback: bare N-N-N near the top of page
+    m = re.search(r'\b(\d+)-(\d+)-(\d+)\b', html[:5000])
     if m:
         return {"wins": m.group(1), "losses": m.group(2), "draws": m.group(3)}
     return {"wins": "N/A", "losses": "N/A", "draws": "N/A"}
 
 
 def count_win_methods(fight_history: list[dict]) -> dict:
-    """Count wins by method from the parsed fight history."""
     ko = sub = dec = 0
     for f in fight_history:
         if f["result"] != "WIN":
@@ -170,52 +162,65 @@ def count_win_methods(fight_history: list[dict]) -> dict:
             sub += 1
         elif "DEC" in method:
             dec += 1
-    label = f"(last {len(fight_history)} fights)"
     return {
-        "ko":  str(ko),
-        "sub": str(sub),
-        "dec": str(dec),
-        "note": f"Counted from {label}",
+        "ko":   str(ko),
+        "sub":  str(sub),
+        "dec":  str(dec),
+        "note": f"(last {len(fight_history)} fights)",
     }
 
 
-def parse_fight_history(markdown: str, limit: int = 10) -> list[dict]:
-    """Parse recent fight history from the profile page markdown."""
+def parse_fight_history(html: str, fighter_url: str, limit: int = 10) -> list[dict]:
+    """Parse recent fight history from the fighter profile HTML."""
     fights = []
 
-    full_row_pattern = re.compile(
-        r'(\|\s*\[_(win|loss|draw|nc)_\]\([^)]+\)\s*\|[^\n]+)',
-        re.IGNORECASE
+    row_pattern = re.compile(
+        r'<tr[^>]*class="b-fight-details__table-row[^"]*js-fight-details-click[^"]*"[^>]*>(.*?)</tr>',
+        re.DOTALL,
     )
 
-    for row_match in full_row_pattern.finditer(markdown):
-        row = row_match.group(1)
+    for row_match in row_pattern.finditer(html):
+        row_html = row_match.group(1)
 
-        result_m = re.search(r'\[_(win|loss|draw|nc)_\]', row, re.IGNORECASE)
-        result = result_m.group(1).upper() if result_m else "N/A"
+        # Result: win / loss / draw / nc
+        result_m = re.search(r'<i[^>]*class="b-flag__text"[^>]*>(\w+)', row_html, re.IGNORECASE)
+        if not result_m:
+            continue
+        result = result_m.group(1).strip().upper()
 
-        fighter_links = re.findall(r'\[([^\]]+)\]\(http://www\.ufcstats\.com/fighter-details/[^)]+\)', row)
-        opponent = fighter_links[1].strip() if len(fighter_links) >= 2 else "N/A"
+        # Fighter links — two per row (self + opponent); opponent is the other URL
+        fighter_links = re.findall(
+            r'<a[^>]+href="(http://www\.ufcstats\.com/fighter-details/[a-f0-9]+)"[^>]*>\s*([^<\n]+?)\s*</a>',
+            row_html,
+        )
+        opponent = "N/A"
+        for url, fname in fighter_links:
+            if url != fighter_url:
+                opponent = fname.strip()
+                break
 
-        clean_row = re.sub(r'!\[[^\]]*\]\([^)]*\)', '', row)
-        clean_row = re.sub(r'\[[^\]]+\]\([^)]+\)', r'LINK', clean_row)
-        cells = [c.strip() for c in clean_row.split('|') if c.strip()]
+        # Extract all <p> text values (plain text cells)
+        p_texts = re.findall(
+            r'<p[^>]*class="b-fight-details__table-text"[^>]*>\s*(.*?)\s*</p>',
+            row_html,
+            re.DOTALL,
+        )
+        plain = [re.sub(r'<[^>]+>', '', t).strip() for t in p_texts]
+        plain = [v for v in plain if v]
 
+        # Method, round, time are near the end of the row
         method = "N/A"
         round_num = "N/A"
         time_str = "N/A"
 
-        if len(cells) >= 4:
-            time_str = cells[-1].strip() if re.match(r'\d+:\d+', cells[-1]) else "N/A"
-            if len(cells) >= 5 and re.match(r'^\d$', cells[-2]):
-                round_num = cells[-2]
-            for cell in cells:
-                cell_clean = re.sub(r'<br>.*', '', cell).strip()
-                if re.match(r'(KO|TKO|SUB|U-DEC|S-DEC|M-DEC|Decision|Overturned|DQ|NC)', cell_clean, re.IGNORECASE):
-                    method = cell_clean
-                    break
-
-        opponent = re.sub(r'[_*`]', '', opponent).strip()
+        for val in reversed(plain):
+            if re.match(r'^\d:\d\d$|^\d:\d\d\d$|^\d+:\d\d$', val):
+                time_str = val
+            elif re.match(r'^\d$', val) and round_num == "N/A":
+                round_num = val
+            elif re.match(r'(KO|TKO|SUB|U-DEC|S-DEC|M-DEC|Decision|Overturned|DQ|NC)', val, re.IGNORECASE):
+                method = val
+                break
 
         if opponent and opponent != "N/A":
             fights.append({
@@ -237,47 +242,46 @@ def parse_fight_history(markdown: str, limit: int = 10) -> list[dict]:
 def scrape_fighter(name: str, debug: bool = False) -> dict:
     """
     Given a fighter name, scrape ufcstats.com and return a structured stats dict.
-    This is the primary import target for app.py and compare_fighters.py.
     """
     print(f"Fetching data for {name}...")
 
     profile_url, matched_name = find_fighter_url(name, debug=debug)
     print(f"  Found profile: {profile_url}")
 
-    print(f"  Scraping stats...")
-    markdown = firecrawl_get(profile_url)
+    print("  Scraping stats...")
+    html = _get(profile_url)
     time.sleep(DELAY)
 
     if debug:
-        print(f"\n--- RAW PROFILE MARKDOWN (first 8000 chars) ---")
-        print(markdown[:8000])
+        print("\n--- RAW PROFILE HTML (first 5000 chars) ---")
+        print(html[:5000])
         print("--- END ---\n")
 
-    record = parse_record(markdown)
-    fight_history = parse_fight_history(markdown)
+    record = parse_record(html)
+    fight_history = parse_fight_history(html, profile_url)
 
     data = {
         "name":        matched_name,
         "profile_url": profile_url,
-        "height":      parse_stat(markdown, "Height:"),
-        "weight":      parse_stat(markdown, "Weight:"),
-        "reach":       parse_stat(markdown, "Reach:"),
-        "stance":      parse_stat(markdown, "STANCE:", "Stance:"),
-        "dob":         parse_stat(markdown, "DOB:"),
+        "height":      parse_stat_html(html, "Height:"),
+        "weight":      parse_stat_html(html, "Weight:"),
+        "reach":       parse_stat_html(html, "Reach:"),
+        "stance":      parse_stat_html(html, "STANCE:", "Stance:"),
+        "dob":         parse_stat_html(html, "DOB:"),
         "team":        "N/A — not listed on ufcstats.com",
         "record":      record,
         "win_methods": count_win_methods(fight_history),
         "striking": {
-            "slpm":    parse_stat(markdown, "SLpM:"),
-            "str_acc": parse_stat(markdown, "Str. Acc.:"),
-            "sapm":    parse_stat(markdown, "SApM:"),
-            "str_def": parse_stat(markdown, "Str. Def:"),
+            "slpm":    parse_stat_html(html, "SLpM:"),
+            "str_acc": parse_stat_html(html, "Str. Acc.:"),
+            "sapm":    parse_stat_html(html, "SApM:"),
+            "str_def": parse_stat_html(html, "Str. Def:"),
         },
         "grappling": {
-            "td_avg":  parse_stat(markdown, "TD Avg.:"),
-            "td_acc":  parse_stat(markdown, "TD Acc.:"),
-            "td_def":  parse_stat(markdown, "TD Def.:"),
-            "sub_avg": parse_stat(markdown, "Sub. Avg.:"),
+            "td_avg":  parse_stat_html(html, "TD Avg.:"),
+            "td_acc":  parse_stat_html(html, "TD Acc.:"),
+            "td_def":  parse_stat_html(html, "TD Def.:"),
+            "sub_avg": parse_stat_html(html, "Sub. Avg.:"),
         },
         "fight_history": fight_history,
     }
